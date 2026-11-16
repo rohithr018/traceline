@@ -1,102 +1,28 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { invoke } from "@forge/bridge";
 import ForgeReconciler, {
 	Button,
 	Heading,
 	Inline,
 	SectionMessage,
-	Spinner,
 	Stack,
 	Text,
 	useProductContext,
 } from "@forge/react";
 
-function getSeverityLabel(severity) {
-	switch (severity) {
-		case "CRITICAL":
-			return "Critical";
-		case "HIGH":
-			return "High";
-		case "MEDIUM":
-			return "Medium";
-		case "LOW":
-			return "Low";
-		default:
-			return "Unclassified";
-	}
-}
-
-function formatTimestamp(timestamp) {
-	if (!timestamp) return "Not available";
-
-	return new Date(timestamp).toLocaleString();
-}
-
-function FindingCard({ finding }) {
-	const [expanded, setExpanded] = useState(false);
-
-	return (
-		<Stack space="space.150">
-			<Inline alignBlock="center" spread="space-between">
-				<Stack space="space.050">
-					<Text weight="bold">{finding.nodeId}</Text>
-					<Text>{getSeverityLabel(finding.severity)} impact</Text>
-				</Stack>
-
-				<Stack space="space.050">
-					<Text weight="bold">{finding.score ?? "N/A"}/100</Text>
-					<Text>Depth: {finding.minimumDepth}</Text>
-				</Stack>
-			</Inline>
-
-			{finding.explanation && <Text>{finding.explanation}</Text>}
-
-			{finding.evidence?.length > 0 && (
-				<>
-					<Button
-						appearance="subtle"
-						onClick={() => setExpanded((current) => !current)}
-					>
-						{expanded ? "Hide evidence" : "Show evidence"}
-					</Button>
-
-					{expanded && (
-						<Stack space="space.150">
-							{finding.evidence.map((path, index) => (
-								<Stack key={`${finding.nodeId}-${index}`} space="space.100">
-									<Text weight="bold">
-										Path {index + 1} · Depth {path.depth} · Confidence{" "}
-										{(path.confidence * 100).toFixed(0)}%
-									</Text>
-
-									{path.relationships.map((relationship) => (
-										<Stack key={relationship.edgeId} space="space.050">
-											<Text>
-												{relationship.sourceName} →{" "}
-												{relationship.type ?? "UNKNOWN"} →{" "}
-												{relationship.targetName}
-											</Text>
-
-											{relationship.sourceSystem && (
-												<Text>Source: {relationship.sourceSystem}</Text>
-											)}
-
-											{relationship.evidenceText && (
-												<Text>Evidence: {relationship.evidenceText}</Text>
-											)}
-										</Stack>
-									))}
-								</Stack>
-							))}
-						</Stack>
-					)}
-				</>
-			)}
-		</Stack>
-	);
-}
+import RiskSummary from "./components/RiskSummary";
+import SyncPanel from "./components/SyncPanel";
+import FindingsPanel from "./components/FindingsPanel";
+import AnalysisStatus from "./components/AnalysisStatus";
+import ImpactGraph from "./components/ImpactGraph";
+import ImpactPathPanel from "./components/ImpactPathPanel";
+import InvestigationSummary from "./components/InvestigationSummary";
 
 function TraceLinePanel() {
+	const analysisRequests = useRef(new Map());
+	const syncLock = useRef(false);
+	const criticalityLock = useRef(null);
+
 	const context = useProductContext();
 	const issue = context?.extension?.issue;
 
@@ -105,54 +31,200 @@ function TraceLinePanel() {
 
 	const projectKey = issueKey?.match(/^([A-Z][A-Z0-9_]*)-\d+$/)?.[1];
 
+	const currentIssueIdRef = useRef(issueId);
+	currentIssueIdRef.current = issueId;
+	const currentProjectKeyRef = useRef(projectKey);
+	currentProjectKeyRef.current = projectKey;
+
 	const [loading, setLoading] = useState(false);
 	const [syncing, setSyncing] = useState(false);
 
 	const [findings, setFindings] = useState([]);
+	const [risk, setRisk] = useState(null);
+	const [analysisDataIssueId, setAnalysisDataIssueId] = useState(null);
+
 	const [error, setError] = useState("");
+	const [analysisErrorIssueId, setAnalysisErrorIssueId] = useState(null);
+	const [analysisLoadingIssueId, setAnalysisLoadingIssueId] = useState(null);
 	const [syncError, setSyncError] = useState("");
+	const [criticalityError, setCriticalityError] = useState("");
+	const [criticalityMessage, setCriticalityMessage] = useState("");
+
+	const [criticalityUpdatingNodeId, setCriticalityUpdatingNodeId] =
+		useState(null);
 
 	const [syncResult, setSyncResult] = useState(null);
 	const [syncStatus, setSyncStatus] = useState(null);
+	const [syncProjectKey, setSyncProjectKey] = useState(null);
 
 	const [truncated, setTruncated] = useState(false);
 	const [hasAnalyzed, setHasAnalyzed] = useState(false);
+	const [selectedFindingId, setSelectedFindingId] = useState(null);
 
-	async function runImpactAnalysis() {
-		if (!issueId) {
+	const hasCurrentAnalysis = hasAnalyzed && analysisDataIssueId === issueId;
+	const currentAnalysisLoading =
+		loading && analysisLoadingIssueId === issueId;
+	const currentAnalysisError =
+		analysisErrorIssueId === issueId ? error : "";
+	const currentFindings = hasCurrentAnalysis ? findings : [];
+	const currentRisk = hasCurrentAnalysis ? risk : null;
+
+	// Clear issue-specific investigation data when Jira navigation changes.
+	useEffect(() => {
+		setSelectedFindingId(null);
+		setFindings([]);
+		setRisk(null);
+		setAnalysisDataIssueId(null);
+		setTruncated(false);
+		setHasAnalyzed(false);
+		setLoading(false);
+		setAnalysisLoadingIssueId(null);
+		setError("");
+		setAnalysisErrorIssueId(null);
+		setCriticalityError("");
+		setCriticalityMessage("");
+		setCriticalityUpdatingNodeId(null);
+		criticalityLock.current = null;
+	}, [issueId]);
+
+	async function runImpactAnalysis(targetIssueId) {
+		if (!targetIssueId) {
 			throw new Error("Unable to identify the current Jira issue.");
 		}
 
 		const response = await invoke("impact.analyze", {
-			sourceNodeId: `jira:issue:${issueId}`,
+			sourceNodeId: `jira:issue:${targetIssueId}`,
 		});
 
 		if (!response?.ok) {
 			throw new Error(response?.error?.message ?? "Impact analysis failed.");
 		}
 
-		setFindings(response.data.findings ?? []);
-		setTruncated(response.data.truncated ?? false);
+		// Ignore results belonging to an issue that is no longer open.
+		if (currentIssueIdRef.current !== targetIssueId) {
+			return false;
+		}
+
+		const data = response.data;
+
+		// Replace previous results only after successful analysis.
+		setFindings(Array.isArray(data?.findings) ? data.findings : []);
+		setRisk(data?.risk && typeof data.risk === "object" ? data.risk : null);
+		setTruncated(Boolean(data?.truncated));
 		setHasAnalyzed(true);
+		setAnalysisDataIssueId(targetIssueId);
+		setSelectedFindingId(null);
+
+		return true;
 	}
 
 	async function analyzeImpact() {
+		if (!issueId) {
+			return false;
+		}
+
+		const targetIssueId = issueId;
+
+		// Prevent duplicate requests for the same issue while allowing
+		// a new issue to be analyzed during navigation.
+		if (analysisRequests.current.has(targetIssueId)) {
+			return false;
+		}
+
+		const requestToken = Symbol(targetIssueId);
+		analysisRequests.current.set(targetIssueId, requestToken);
+
 		setLoading(true);
+		setAnalysisLoadingIssueId(targetIssueId);
 		setError("");
+		setAnalysisErrorIssueId(null);
+
+		let succeeded = false;
 
 		try {
-			await runImpactAnalysis();
+			succeeded = await runImpactAnalysis(targetIssueId);
 		} catch (err) {
-			setFindings([]);
-			setHasAnalyzed(false);
-
-			setError(
-				err instanceof Error
-					? err.message
-					: "Unable to complete impact analysis.",
-			);
+			if (currentIssueIdRef.current === targetIssueId) {
+				setError(
+					err instanceof Error
+						? err.message
+						: "Unable to complete impact analysis.",
+				);
+				setAnalysisErrorIssueId(targetIssueId);
+			}
 		} finally {
-			setLoading(false);
+			if (analysisRequests.current.get(targetIssueId) === requestToken) {
+				analysisRequests.current.delete(targetIssueId);
+			}
+
+			if (currentIssueIdRef.current === targetIssueId) {
+				setLoading(false);
+				setAnalysisLoadingIssueId(null);
+			}
+		}
+
+		return succeeded;
+	}
+
+	async function updateCriticality(nodeId, criticality) {
+		if (criticalityLock.current !== null) {
+			return;
+		}
+
+		const targetIssueId = issueId;
+		const requestToken = Symbol(nodeId);
+
+		criticalityLock.current = requestToken;
+		setCriticalityUpdatingNodeId(nodeId);
+		setCriticalityError("");
+		setCriticalityMessage("");
+
+		try {
+			const response = await invoke("risk.updateCriticality", {
+				nodeId,
+				criticality,
+			});
+
+			if (!response?.ok) {
+				throw new Error(
+					response?.error?.message ?? "Unable to update component criticality.",
+				);
+			}
+
+			// Do not update the newly opened issue's UI with an old
+			// issue's criticality operation.
+			if (currentIssueIdRef.current !== targetIssueId) {
+				return;
+			}
+
+			const refreshed = await analyzeImpact();
+
+			if (currentIssueIdRef.current !== targetIssueId) {
+				return;
+			}
+
+			if (refreshed) {
+				setCriticalityMessage(
+					`Criticality for ${nodeId} updated to ${criticality}.`,
+				);
+			} else {
+				setCriticalityMessage(
+					`Criticality for ${nodeId} was updated. Re-analyze to refresh the risk scores.`,
+				);
+			}
+		} catch (err) {
+			if (currentIssueIdRef.current === targetIssueId) {
+				setCriticalityError(
+					err instanceof Error
+						? err.message
+						: "Unable to update component criticality.",
+				);
+			}
+		} finally {
+			if (criticalityLock.current === requestToken) {
+				criticalityLock.current = null;
+				setCriticalityUpdatingNodeId(null);
+			}
 		}
 	}
 
@@ -162,11 +234,18 @@ function TraceLinePanel() {
 			return;
 		}
 
+		if (syncLock.current) {
+			return;
+		}
+
+		const targetIssueId = issueId;
+
+		syncLock.current = true;
 		setSyncing(true);
+		setSyncProjectKey(projectKey);
 		setSyncStatus("QUEUED");
 		setSyncError("");
 		setSyncResult(null);
-		setError("");
 
 		try {
 			const response = await invoke("jira.syncProject", {
@@ -180,47 +259,57 @@ function TraceLinePanel() {
 				);
 			}
 
-			const status = response.data?.status;
+			if (currentIssueIdRef.current !== targetIssueId) {
+				return;
+			}
 
+			const status = response.data?.status;
 			setSyncStatus(status ?? "QUEUED");
 
-			// The backend only queues the job.
-			// The polling effect below waits for actual completion.
 			if (status === "SUCCEEDED") {
+				setSyncResult(response.data);
 				setSyncing(false);
+				await analyzeImpact();
 			}
 		} catch (err) {
-			setSyncing(false);
-
-			setSyncError(
-				err instanceof Error
-					? err.message
-					: "Unable to synchronize the Jira project.",
-			);
+			if (currentIssueIdRef.current === targetIssueId) {
+				setSyncing(false);
+				setSyncError(
+					err instanceof Error
+						? err.message
+						: "Unable to synchronize the Jira project.",
+				);
+			}
+		} finally {
+			syncLock.current = false;
 		}
 	}
 
-	/**
-	 * Poll the backend while the synchronization is queued or running.
-	 *
-	 * The effect automatically stops when the component unmounts
-	 * or synchronization reaches a terminal state.
-	 */
+	// Poll Jira synchronization status.
 	useEffect(() => {
-		if (!syncing || !projectKey) {
+		if (!syncing || !syncProjectKey) {
 			return;
 		}
 
 		let cancelled = false;
 		let timeoutId;
+		const pollStartedAt = Date.now();
 
 		async function pollSyncStatus() {
 			try {
+				if (Date.now() - pollStartedAt > 20 * 60 * 1000) {
+					setSyncError("Synchronization is taking longer than expected.");
+					setSyncing(false);
+					return;
+				}
+
 				const response = await invoke("jira.getSyncStatus", {
-					projectKey,
+					projectKey: syncProjectKey,
 				});
 
-				if (cancelled) return;
+				if (cancelled) {
+					return;
+				}
 
 				if (!response?.ok) {
 					throw new Error(
@@ -232,7 +321,6 @@ function TraceLinePanel() {
 				const checkpoint = response.data;
 
 				if (!checkpoint) {
-					// The queue event may not have been processed yet.
 					timeoutId = setTimeout(pollSyncStatus, 2000);
 					return;
 				}
@@ -251,24 +339,11 @@ function TraceLinePanel() {
 					setSyncResult(checkpoint);
 					setSyncing(false);
 
-					// Refresh impact analysis only after ingestion succeeds.
-					setLoading(true);
-					setError("");
-
-					try {
-						await runImpactAnalysis();
-					} catch (err) {
-						if (!cancelled) {
-							setError(
-								err instanceof Error
-									? err.message
-									: "Synchronization succeeded, but impact analysis failed.",
-							);
-						}
-					} finally {
-						if (!cancelled) {
-							setLoading(false);
-						}
+					if (
+						!cancelled &&
+						currentProjectKeyRef.current === syncProjectKey
+					) {
+						await analyzeImpact();
 					}
 
 					return;
@@ -278,22 +353,21 @@ function TraceLinePanel() {
 					setSyncError(
 						checkpoint.lastError ?? "Jira project synchronization failed.",
 					);
-
 					setSyncing(false);
 					return;
 				}
 
-				// Unknown status: keep checking instead of assuming success.
 				timeoutId = setTimeout(pollSyncStatus, 2000);
 			} catch (err) {
-				if (cancelled) return;
+				if (cancelled) {
+					return;
+				}
 
 				setSyncError(
 					err instanceof Error
 						? err.message
 						: "Unable to check synchronization progress.",
 				);
-
 				setSyncing(false);
 			}
 		}
@@ -307,56 +381,15 @@ function TraceLinePanel() {
 				clearTimeout(timeoutId);
 			}
 		};
-	}, [syncing, projectKey, issueId]);
+	}, [syncing, syncProjectKey]);
 
-	/**
-	 * Load impact analysis when the Jira panel opens.
-	 */
+	// Initial analysis when the Jira panel opens or issue changes.
 	useEffect(() => {
-		if (!issueId) return;
-
-		let cancelled = false;
-
-		async function initialAnalysis() {
-			setLoading(true);
-			setError("");
-
-			try {
-				const response = await invoke("impact.analyze", {
-					sourceNodeId: `jira:issue:${issueId}`,
-				});
-
-				if (cancelled) return;
-
-				if (!response?.ok) {
-					throw new Error(
-						response?.error?.message ?? "Impact analysis failed.",
-					);
-				}
-
-				setFindings(response.data.findings ?? []);
-				setTruncated(response.data.truncated ?? false);
-				setHasAnalyzed(true);
-			} catch (err) {
-				if (!cancelled) {
-					setError(
-						err instanceof Error
-							? err.message
-							: "Unable to complete impact analysis.",
-					);
-				}
-			} finally {
-				if (!cancelled) {
-					setLoading(false);
-				}
-			}
+		if (!issueId) {
+			return;
 		}
 
-		initialAnalysis();
-
-		return () => {
-			cancelled = true;
-		};
+		analyzeImpact();
 	}, [issueId]);
 
 	if (!issueId) {
@@ -367,143 +400,109 @@ function TraceLinePanel() {
 		);
 	}
 
+	const selectedFinding =
+		currentFindings.find((finding) => finding.nodeId === selectedFindingId) ??
+		null;
+
 	return (
 		<Stack space="space.200">
 			<Stack space="space.050">
 				<Heading size="large">TraceLine Impact Analysis</Heading>
 
-				<Text>
-					Analyze engineering dependencies and potentially affected work.
-				</Text>
+				<Text>Engineering dependency and change impact intelligence.</Text>
 
 				<Text weight="bold">Issue: {issueKey ?? issueId}</Text>
 
 				<Text>Project: {projectKey ?? "Unknown"}</Text>
 			</Stack>
 
+			<SyncPanel
+				projectKey={projectKey}
+				syncProjectKey={syncProjectKey}
+				syncing={syncing}
+				loading={currentAnalysisLoading || criticalityUpdatingNodeId !== null}
+				syncStatus={syncStatus}
+				syncResult={syncResult}
+				syncError={syncError}
+				onSync={syncProject}
+			/>
+
 			<Stack space="space.100">
-				<Heading size="medium">Jira synchronization</Heading>
+				<Inline alignBlock="center" spread="space-between">
+					<Heading size="medium">Impact analysis</Heading>
 
-				<Button
-					appearance="primary"
-					onClick={syncProject}
-					isDisabled={syncing || loading || !projectKey}
-				>
-					{syncing ? "Synchronization in progress..." : "Sync Jira Project"}
-				</Button>
+					<Button
+						appearance="subtle"
+						onClick={analyzeImpact}
+						isDisabled={
+						currentAnalysisLoading || syncing || criticalityUpdatingNodeId !== null
+						}
+					>
+						Re-analyze
+					</Button>
+				</Inline>
 
-				{syncStatus === "QUEUED" && (
-					<SectionMessage appearance="information">
+				<Text>Review affected components and understand their risk.</Text>
+
+				<AnalysisStatus
+					loading={currentAnalysisLoading}
+					hasAnalyzed={hasCurrentAnalysis}
+					error={currentAnalysisError}
+					onRetry={analyzeImpact}
+				/>
+
+				{truncated && hasCurrentAnalysis && (
+					<SectionMessage appearance="warning">
 						<Text>
-							Synchronization has been queued and is waiting for a worker.
+							This analysis reached a traversal limit. Some affected components or
+							dependency paths may be missing.
 						</Text>
 					</SectionMessage>
 				)}
 
-				{syncStatus === "IN_PROGRESS" && (
-					<Inline alignBlock="center" space="space.100">
-						<Spinner size="small" />
-						<Text>Importing Jira issues and relationships...</Text>
-					</Inline>
-				)}
-
-				{syncResult && (
-					<SectionMessage appearance="confirmation">
-						<Stack space="space.100">
-							<Text weight="bold">Project synchronization completed.</Text>
-
-							<Text>
-								Last successful sync:{" "}
-								{formatTimestamp(syncResult.lastSuccessfulSyncAt)}
-							</Text>
-
-							{syncResult.result && (
-								<>
-									{syncResult.result.fetchedIssues !== undefined && (
-										<Text>
-											Issues fetched: {syncResult.result.fetchedIssues}
-										</Text>
-									)}
-
-									{syncResult.result.persistedNodes !== undefined && (
-										<Text>
-											Nodes persisted: {syncResult.result.persistedNodes}
-										</Text>
-									)}
-
-									{syncResult.result.placeholderNodes !== undefined && (
-										<Text>
-											Placeholder nodes: {syncResult.result.placeholderNodes}
-										</Text>
-									)}
-
-									{syncResult.result.persistedEdges !== undefined && (
-										<Text>
-											Relationships persisted:{" "}
-											{syncResult.result.persistedEdges}
-										</Text>
-									)}
-								</>
-							)}
-						</Stack>
-					</SectionMessage>
-				)}
-
-				{syncError && (
-					<SectionMessage appearance="error">
-						<Text>{syncError}</Text>
-					</SectionMessage>
-				)}
-			</Stack>
-
-			<Stack space="space.100">
-				<Heading size="medium">Impact analysis</Heading>
-
-				<Button
-					appearance="default"
-					onClick={analyzeImpact}
-					isDisabled={loading || syncing}
-				>
-					{loading ? "Analyzing..." : "Refresh impact analysis"}
-				</Button>
-
-				{loading && (
-					<Inline alignBlock="center" space="space.100">
-						<Spinner size="small" />
-						<Text>Tracing dependencies...</Text>
-					</Inline>
-				)}
-
-				{error && (
-					<SectionMessage appearance="error">
-						<Text>{error}</Text>
-					</SectionMessage>
-				)}
-
-				{hasAnalyzed && !loading && !error && (
+				{hasCurrentAnalysis && (
 					<Stack space="space.200">
-						<Heading size="medium">Affected items ({findings.length})</Heading>
+						<InvestigationSummary
+							findings={currentFindings}
+							risk={currentRisk}
+						/>
 
-						{truncated && (
-							<SectionMessage appearance="warning">
-								<Text>
-									The analysis reached a traversal limit. Some potential impacts
-									may not be included.
-								</Text>
+						{criticalityError && (
+							<SectionMessage appearance="error">
+								<Text>{criticalityError}</Text>
 							</SectionMessage>
 						)}
 
-						{findings.length === 0 ? (
-							<SectionMessage appearance="information">
-								<Text>No affected graph nodes were found for this issue.</Text>
+						{criticalityMessage && (
+							<SectionMessage appearance="confirmation">
+								<Text>{criticalityMessage}</Text>
 							</SectionMessage>
-						) : (
-							findings.map((finding) => (
-								<Stack key={finding.nodeId} space="space.150">
-									<FindingCard finding={finding} />
-								</Stack>
-							))
 						)}
+
+						<ImpactGraph
+							key={issueId}
+							sourceNodeId={`jira:issue:${issueId}`}
+							findings={currentFindings}
+							risk={currentRisk}
+							selectedNodeId={selectedFindingId}
+							onSelectNode={setSelectedFindingId}
+						/>
+
+						<RiskSummary
+							risk={currentRisk}
+							onCriticalityChange={updateCriticality}
+							updatingNodeId={criticalityUpdatingNodeId}
+							analysisLoading={currentAnalysisLoading}
+						/>
+
+						<FindingsPanel
+							key={issueId}
+							findings={currentFindings}
+							selectedFindingId={selectedFindingId}
+							onSelectFinding={setSelectedFindingId}
+						/>
+
+						<ImpactPathPanel finding={selectedFinding} />
 					</Stack>
 				)}
 			</Stack>

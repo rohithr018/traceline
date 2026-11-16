@@ -134,4 +134,10 @@ export * from "./impact/services/impact-scoring";
 export * from "./impact/services/impact-explanation";
 
 export * from "./impact/api/impact-api-contract";
+
+export * from "./risk/models/risk-analysis";
+export * from "./risk/validation/risk-request-validator";
+export * from "./risk/services/risk-scoring";
+export * from "./risk/services/risk-analysis-service";
+
 export { impactAnalysisHandler };

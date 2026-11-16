@@ -13,11 +13,26 @@ import { buildImpactAnalysisRequest } from "./impact-api-contract";
 
 import { SqlSyncCheckpointStore } from "../../sync/sql-sync-checkpoint-store";
 
+import { RiskAnalysisService } from "../../risk/services/risk-analysis-service";
+
+import {
+	CriticalityService,
+	CriticalityNodeNotFoundError,
+} from "../../risk/services/criticality-service";
+
+import {
+	CriticalityValidationError,
+	validateCriticalityUpdateRequest,
+	validateCriticalityTarget,
+} from "../../risk/validation/criticality-validator";
+
 const resolver = new Resolver();
 
 const repository = new SqlGraphRepository();
 const analysisService = new ImpactAnalysisService(repository);
 const checkpointStore = new SqlSyncCheckpointStore();
+const riskAnalysisService = new RiskAnalysisService();
+const criticalityService = new CriticalityService(repository);
 
 interface ResolverContext {
 	cloudId?: string;
@@ -404,6 +419,7 @@ resolver.define(
 
 		try {
 			const request = buildImpactAnalysisRequest(payload, tenantId);
+
 			logStage("REQUEST_VALIDATED", {
 				sourceNodeId: request.sourceNodeId,
 			});
@@ -454,6 +470,7 @@ resolver.define(
 				edges: edges.length,
 			});
 
+			// Collect nodes used by impact paths.
 			const requiredNodeIds = new Set<string>();
 
 			for (const finding of analysis.findings) {
@@ -461,6 +478,18 @@ resolver.define(
 					for (const nodeId of path.nodeIds) {
 						requiredNodeIds.add(nodeId);
 					}
+				}
+			}
+
+			// Also authorize incoming dependency sources for affected nodes.
+			// These nodes contribute to dependency centrality.
+			const potentialFindingIds = new Set(
+				analysis.findings.map((finding) => finding.nodeId),
+			);
+
+			for (const edge of edges) {
+				if (potentialFindingIds.has(edge.targetNodeId)) {
+					requiredNodeIds.add(edge.sourceNodeId);
 				}
 			}
 
@@ -483,6 +512,7 @@ resolver.define(
 				allowed: [...permissions.values()].filter(Boolean).length,
 			});
 
+			// Retain only impact paths whose every node is readable.
 			const authorizedFindings = analysis.findings.flatMap((finding) => {
 				const authorizedPaths = finding.paths.filter((path) =>
 					path.nodeIds.every((nodeId) => permissions.get(nodeId) === true),
@@ -506,7 +536,58 @@ resolver.define(
 				];
 			});
 
-			const scoredFindings = scoreImpactFindings(authorizedFindings, edges);
+			// Build the authorized graph.
+			const authorizedNodeIds = new Set(
+				[...permissions.entries()]
+					.filter(([, allowed]) => allowed)
+					.map(([nodeId]) => nodeId),
+			);
+
+			const authorizedNodes = nodes.filter((node) =>
+				authorizedNodeIds.has(node.id),
+			);
+
+			const authorizedFindingIds = new Set(
+				authorizedFindings.map((finding) => finding.nodeId),
+			);
+
+			// Identify edges that belong to authorized impact paths.
+			const authorizedPathPairs = new Set<string>();
+
+			for (const finding of authorizedFindings) {
+				for (const path of finding.paths) {
+					for (let index = 0; index < path.nodeIds.length - 1; index++) {
+						authorizedPathPairs.add(
+							JSON.stringify([path.nodeIds[index], path.nodeIds[index + 1]]),
+						);
+					}
+				}
+			}
+
+			// Keep path edges and readable incoming dependency edges.
+			const authorizedEdges = edges.filter((edge) => {
+				if (
+					!authorizedNodeIds.has(edge.sourceNodeId) ||
+					!authorizedNodeIds.has(edge.targetNodeId)
+				) {
+					return false;
+				}
+
+				const isPathEdge = authorizedPathPairs.has(
+					JSON.stringify([edge.sourceNodeId, edge.targetNodeId]),
+				);
+
+				const isIncomingFindingEdge = authorizedFindingIds.has(
+					edge.targetNodeId,
+				);
+
+				return isPathEdge || isIncomingFindingEdge;
+			});
+
+			const scoredFindings = scoreImpactFindings(
+				authorizedFindings,
+				authorizedEdges,
+			);
 
 			logStage("SCORING_COMPLETED", {
 				findings: scoredFindings.length,
@@ -514,9 +595,26 @@ resolver.define(
 
 			const explainedFindings = explainImpactFindings(
 				scoredFindings,
-				nodes,
-				edges,
+				authorizedNodes,
+				authorizedEdges,
 			);
+
+			// Calculate risk after permission filtering.
+			const risk = await riskAnalysisService.analyze({
+				tenantId,
+				impactAnalysis: {
+					...analysis,
+					findings: scoredFindings,
+				},
+				nodes: authorizedNodes,
+				edges: authorizedEdges,
+			});
+
+			logStage("RISK_ANALYSIS_COMPLETED", {
+				overallScore: risk.overallScore,
+				overallLevel: risk.overallLevel,
+				affectedNodeCount: risk.affectedNodeCount,
+			});
 
 			logStage("COMPLETED", {
 				findings: explainedFindings.length,
@@ -527,6 +625,7 @@ resolver.define(
 				data: {
 					...analysis,
 					findings: explainedFindings,
+					risk,
 				},
 			};
 		} catch (error) {
@@ -553,6 +652,184 @@ resolver.define(
 			return failure(
 				"IMPACT_ANALYSIS_FAILED",
 				"Impact analysis could not be completed.",
+			);
+		}
+	},
+);
+
+async function getJiraProjectKey(node: GraphNode): Promise<string> {
+	const projectKey = node.attributes?.projectKey;
+
+	if (typeof projectKey === "string" && projectKey.trim()) {
+		return projectKey.trim();
+	}
+
+	if (node.type === "PROJECT") {
+		const externalId = node.externalId;
+
+		if (typeof externalId === "string" && externalId.trim()) {
+			return externalId.trim();
+		}
+
+		throw new CriticalityValidationError(
+			"Cannot determine the Jira project key.",
+		);
+	}
+
+	if (node.type !== "ISSUE") {
+		throw new CriticalityValidationError(
+			"Cannot determine the Jira project for this component.",
+		);
+	}
+
+	const externalId = node.externalId;
+
+	if (typeof externalId !== "string" || !externalId.trim()) {
+		throw new CriticalityValidationError(
+			"The Jira issue does not have a valid external ID.",
+		);
+	}
+
+	const response = await api
+		.asUser()
+		.requestJira(route`/rest/api/3/issue/${externalId}?fields=project`, {
+			headers: {
+				Accept: "application/json",
+			},
+		});
+
+	if (!response.ok) {
+		throw new Error("Unable to verify Jira project access for this issue.");
+	}
+
+	const issue = (await response.json()) as {
+		fields?: {
+			project?: {
+				key?: string;
+			};
+		};
+	};
+
+	const key = issue.fields?.project?.key;
+
+	if (!key) {
+		throw new CriticalityValidationError(
+			"The Jira issue does not have a readable project.",
+		);
+	}
+
+	return key;
+}
+
+async function canAdministerJiraProject(projectKey: string): Promise<boolean> {
+	const response = await api
+		.asUser()
+		.requestJira(
+			route`/rest/api/3/mypermissions?projectKey=${projectKey}&permissions=ADMINISTER_PROJECTS`,
+			{
+				headers: {
+					Accept: "application/json",
+				},
+			},
+		);
+
+	if (!response.ok) {
+		throw new Error("Unable to verify Jira project administration permission.");
+	}
+
+	const result = (await response.json()) as {
+		permissions?: {
+			ADMINISTER_PROJECTS?: {
+				havePermission?: boolean;
+			};
+		};
+	};
+
+	return result.permissions?.ADMINISTER_PROJECTS?.havePermission === true;
+}
+
+async function authorizeCriticalityUpdate(node: GraphNode): Promise<void> {
+	if (node.source !== "JIRA") {
+		throw new CriticalityValidationError(
+			"Criticality updates are currently supported only for Jira-backed components.",
+		);
+	}
+
+	const projectKey = await getJiraProjectKey(node);
+
+	const allowed = await canAdministerJiraProject(projectKey);
+
+	if (!allowed) {
+		throw new Error(
+			"You need Jira project administration permission to update component criticality.",
+		);
+	}
+}
+
+resolver.define(
+	"risk.updateCriticality",
+	async ({ payload, context }: ResolverRequest) => {
+		const tenantId = context.cloudId;
+		const accountId = context.accountId;
+
+		if (!tenantId) {
+			return failure(
+				"MISSING_INSTALLATION_CONTEXT",
+				"Unable to identify the Forge installation.",
+			);
+		}
+
+		if (!accountId) {
+			return failure(
+				"AUTHENTICATION_REQUIRED",
+				"An authenticated Atlassian user is required.",
+			);
+		}
+
+		try {
+			const request = validateCriticalityUpdateRequest(payload);
+
+			const node = await repository.getNode(tenantId, request.nodeId);
+
+			if (!node) {
+				throw new CriticalityNodeNotFoundError(request.nodeId);
+			}
+
+			validateCriticalityTarget(node, tenantId);
+
+			await authorizeCriticalityUpdate(node);
+
+			const result = await criticalityService.updateCriticality({
+				tenantId,
+				updatedBy: accountId,
+				request,
+			});
+
+			return {
+				ok: true,
+				data: result,
+			};
+		} catch (error) {
+			if (error instanceof CriticalityNodeNotFoundError) {
+				return failure("NODE_NOT_FOUND", error.message);
+			}
+
+			if (error instanceof CriticalityValidationError) {
+				return failure("INVALID_CRITICALITY_REQUEST", error.message);
+			}
+
+			if (
+				error instanceof Error &&
+				error.message.includes("project administration permission")
+			) {
+				return failure("CRITICALITY_ACCESS_DENIED", error.message);
+			}
+
+			console.error("TraceLine criticality update failed:", error);
+
+			return failure(
+				"CRITICALITY_UPDATE_FAILED",
+				"Unable to update component criticality.",
 			);
 		}
 	},
