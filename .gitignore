@@ -1,0 +1,5 @@
+.traceline-verify-token
+token.env
+node_modules/
+.forge
+dist/

@@ -1,0 +1,121 @@
+modules:
+  sql:
+    - key: traceline-sql
+      engine: mysql
+
+  consumer:
+    - key: schema-migration-consumer
+      queue: schema-migration-queue
+      function: run-migration
+
+    - key: jira-sync-consumer
+      queue: jira-sync-queue
+      function: run-jira-sync
+
+  trigger:
+    - key: schema-migration-trigger
+      function: enqueue-migration
+      events:
+        - avi:forge:installed:app
+        - avi:forge:upgraded:app
+
+  scheduledTrigger:
+    - key: schema-migration-retry
+      function: enqueue-migration
+      interval: hour
+
+  function:
+    - key: run-migration
+      handler: index.runMigration
+      timeoutSeconds: 900
+
+    - key: enqueue-migration
+      handler: index.enqueueMigration
+
+    - key: verify-storage
+      handler: index.verifyStorageHandler
+
+    - key: impact-resolver
+      handler: index.impactAnalysisHandler
+
+    - key: run-jira-sync
+      handler: sync/jira-sync-consumer.handler
+      timeoutSeconds: 900
+
+    - key: run-migrations-manually
+      handler: index.runMigrationsHandler
+
+  webtrigger:
+    - key: traceline-storage-verification
+      function: verify-storage
+      urlFormat: v2
+      response:
+        type: static
+        outputs:
+          - key: ok
+            statusCode: 200
+            contentType: text/plain
+            body: "Storage verification passed. Check Forge logs."
+
+          - key: unauthorized
+            statusCode: 401
+            contentType: text/plain
+            body: "Unauthorized."
+
+          - key: method-not-allowed
+            statusCode: 405
+            contentType: text/plain
+            body: "POST required."
+
+          - key: failed
+            statusCode: 500
+            contentType: text/plain
+            body: "Storage verification failed. Check Forge logs."
+    - key: traceline-manual-migrations
+      function: run-migrations-manually
+      urlFormat: v2
+      response:
+        type: static
+        outputs:
+          - key: ok
+            statusCode: 200
+            contentType: text/plain
+            body: "Migration execution completed. Check Forge logs."
+
+          - key: unauthorized
+            statusCode: 401
+            contentType: text/plain
+            body: "Unauthorized."
+
+          - key: method-not-allowed
+            statusCode: 405
+            contentType: text/plain
+            body: "POST required."
+
+          - key: failed
+            statusCode: 500
+            contentType: text/plain
+            body: "Migration execution failed. Check Forge logs."
+  jira:issuePanel:
+    - key: traceline-impact-panel
+      resource: main
+      resolver:
+        function: impact-resolver
+      render: native
+      title: TraceLine Impact
+      icon: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
+
+app:
+  id: ari:cloud:ecosystem::app/00ad1ce5-ff75-4782-a10b-18e314aab3ef
+  runtime:
+    name: nodejs22.x
+
+resources:
+  - key: main
+    path: src/frontend/index.jsx
+
+permissions:
+  scopes:
+    - read:jira-work
+    - read:confluence-content.all
+    - read:page:confluence
