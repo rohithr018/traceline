@@ -45,9 +45,8 @@ function clamp(value: number, min = 0, max = 100): number {
 }
 
 export function getRiskLevel(score: number): RiskLevel {
-	if (score < 20) return "MINIMAL";
-	if (score < 40) return "LOW";
-	if (score < 60) return "MODERATE";
+	if (score < 35) return "LOW";
+	if (score < 60) return "MEDIUM";
 	if (score < 80) return "HIGH";
 	return "CRITICAL";
 }

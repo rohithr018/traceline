@@ -1,4 +1,9 @@
-export function buildImpactGraph(sourceNodeId, findings = [], risk = null) {
+export function buildImpactGraph(
+	sourceNodeId,
+	findings = [],
+	risk = null,
+	sourceNode = {},
+) {
 	const nodesById = new Map();
 	const edgesById = new Map();
 	const riskByNodeId = new Map();
@@ -15,8 +20,8 @@ export function buildImpactGraph(sourceNodeId, findings = [], risk = null) {
 	if (typeof sourceNodeId === "string" && sourceNodeId.length > 0) {
 		nodesById.set(sourceNodeId, {
 			id: sourceNodeId,
-			name: sourceNodeId,
-			type: "ISSUE",
+			name: sourceNode.name || sourceNodeId,
+				type: sourceNode.type || "ISSUE",
 			depth: 0,
 			isSource: true,
 			riskScore: null,
@@ -104,6 +109,8 @@ export function buildImpactGraph(sourceNodeId, findings = [], risk = null) {
 						sourceSystem: relationship.sourceSystem ?? null,
 						evidenceText: relationship.evidenceText ?? null,
 						externalReference: relationship.externalReference ?? null,
+						propagatedToDependent:
+							relationship.propagatedToDependent === true,
 					});
 				}
 			}

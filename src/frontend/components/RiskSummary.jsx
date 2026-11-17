@@ -91,10 +91,18 @@ export default function RiskSummary({
 										spacing="compact"
 										options={CRITICALITY_OPTIONS}
 										value={selectedOption}
-										isDisabled={analysisLoading || updatingNodeId !== null}
+										isDisabled={
+											!onCriticalityChange ||
+											analysisLoading ||
+											updatingNodeId !== null
+										}
 										isSearchable={false}
 										onChange={(option) => {
-											if (option?.value && option.value !== item.criticality) {
+											if (
+											onCriticalityChange &&
+											option?.value &&
+											option.value !== item.criticality
+										) {
 												onCriticalityChange(item.nodeId, option.value);
 											}
 										}}

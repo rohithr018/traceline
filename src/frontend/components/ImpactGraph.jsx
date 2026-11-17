@@ -16,6 +16,9 @@ import GraphLegend from "./GraphLegend";
 
 export default function ImpactGraph({
 	sourceNodeId,
+	sourceName,
+	sourceType = "ISSUE",
+	sourceLabel = "Source issue",
 	findings = [],
 	risk = null,
 	selectedNodeId = null,
@@ -26,8 +29,12 @@ export default function ImpactGraph({
 	const [connectedOnly, setConnectedOnly] = useState(false);
 
 	const graph = useMemo(
-		() => buildImpactGraph(sourceNodeId, findings, risk),
-		[sourceNodeId, findings, risk],
+		() =>
+			buildImpactGraph(sourceNodeId, findings, risk, {
+				name: sourceName,
+				type: sourceType,
+			}),
+		[sourceNodeId, sourceName, sourceType, findings, risk],
 	);
 
 	const depths = graph.nodesByDepth.map((group) => group.depth);
@@ -110,7 +117,7 @@ export default function ImpactGraph({
 
 	if (graph.affectedNodeCount === 0) {
 		const emptyMessage = findings.length === 0
-			? "No affected components were identified for this issue."
+			? `No affected components were identified for this ${sourceType.toLowerCase()}.`
 			: "Affected components were found, but no dependency path evidence is available to display.";
 
 		return (
@@ -143,7 +150,9 @@ export default function ImpactGraph({
 				</Inline>
 			</Stack>
 
-			<GraphLegend />
+			<GraphLegend
+				sourceLabel={`Source is the ${sourceLabel.toLowerCase()}.`}
+			/>
 
 			<Stack space="space.100">
 				<Text weight="semibold">Search components</Text>
@@ -155,7 +164,7 @@ export default function ImpactGraph({
 					onChange={(event) => setSearchQuery(event?.target?.value ?? "")}
 				/>
 
-					<Text color="color.text.subtle" size="small">
+				<Text color="color.text.subtle" size="small">
 					{visibleNodeCount} of {graph.nodes.length} nodes shown
 				</Text>
 			</Stack>
@@ -216,7 +225,7 @@ export default function ImpactGraph({
 							<Stack key={group.depth} space="space.100">
 								<Heading size="small">
 									{group.depth === 0
-										? "Source issue"
+										? sourceLabel
 										: `Dependency depth ${group.depth}`}
 								</Heading>
 
@@ -255,7 +264,7 @@ export default function ImpactGraph({
 												color="color.text.subtle"
 												weight={highlighted ? "semibold" : "regular"}
 											>
-												-- {edge.type} →
+												-- {edge.propagatedToDependent ? "IMPACTS_DEPENDENT" : edge.type} →
 											</Text>
 
 											<Text
@@ -314,7 +323,7 @@ export default function ImpactGraph({
 							selectedEdges.map((edge) => (
 								<Stack key={edge.id} space="space.050">
 									<Text size="small" weight="semibold">
-										{edge.sourceName} -- {edge.type} → {edge.targetName}
+									{edge.sourceName} -- {edge.propagatedToDependent ? "IMPACTS_DEPENDENT" : edge.type} → {edge.targetName}
 									</Text>
 
 									{edge.evidenceText && (

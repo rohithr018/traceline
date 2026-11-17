@@ -45,6 +45,9 @@ modules:
     - key: run-migrations-manually
       handler: index.runMigrationsHandler
 
+    - key: bb-bridge-receiver
+      handler: index.receiveBitbucketBridgeEvent
+
   webtrigger:
     - key: traceline-storage-verification
       function: verify-storage
@@ -96,6 +99,11 @@ modules:
             statusCode: 500
             contentType: text/plain
             body: "Migration execution failed. Check Forge logs."
+    - key: traceline-bitbucket-bridge
+      function: bb-bridge-receiver
+      urlFormat: v2
+      response:
+        type: dynamic
   jira:issuePanel:
     - key: traceline-impact-panel
       resource: main
@@ -105,6 +113,14 @@ modules:
       title: TraceLine Impact
       icon: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
 
+  jira:globalPage:
+    - key: traceline-engineering-dashboard
+      resource: dashboard
+      resolver:
+        function: impact-resolver
+      render: native
+      title: TraceLine
+
 app:
   id: ari:cloud:ecosystem::app/00ad1ce5-ff75-4782-a10b-18e314aab3ef
   runtime:
@@ -113,6 +129,8 @@ app:
 resources:
   - key: main
     path: src/frontend/index.jsx
+  - key: dashboard
+    path: src/frontend/dashboard.jsx
 
 permissions:
   scopes:

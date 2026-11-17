@@ -9,6 +9,13 @@ import {
 	CREATE_EDGE_TARGET_INDEX,
 } from "./schema/001_create_graph_tables";
 
+import {
+	CREATE_BITBUCKET_WORKSPACE_LINKS,
+	CREATE_BITBUCKET_BRIDGE_EVENTS,
+	CREATE_BITBUCKET_BRIDGE_EVENT_STATUS_INDEX,
+	ADD_BITBUCKET_BRIDGE_EVENT_LEASE_EXPIRY,
+} from "./schema/010_create_bitbucket_bridge_tables";
+
 export const CREATE_SYNC_CHECKPOINTS = `
   CREATE TABLE IF NOT EXISTS sync_checkpoints (
     tenant_id VARCHAR(255) NOT NULL,
@@ -46,8 +53,23 @@ const migrations = migrationRunner
 	.enqueue(
 		"v009_add_sync_checkpoint_result_json",
 		ADD_SYNC_CHECKPOINT_RESULT_JSON,
+	)
+	.enqueue(
+		"v010_create_bitbucket_workspace_links",
+		CREATE_BITBUCKET_WORKSPACE_LINKS,
+	)
+	.enqueue(
+		"v011_create_bitbucket_bridge_events",
+		CREATE_BITBUCKET_BRIDGE_EVENTS,
+	)
+	.enqueue(
+		"v012_create_bitbucket_bridge_event_status_index",
+		CREATE_BITBUCKET_BRIDGE_EVENT_STATUS_INDEX,
+	)
+	.enqueue(
+		"v013_add_bitbucket_bridge_event_lease_expiry",
+		ADD_BITBUCKET_BRIDGE_EVENT_LEASE_EXPIRY,
 	);
-
 export async function runMigrations(): Promise<void> {
 	await migrations.run();
 

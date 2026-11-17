@@ -6,6 +6,14 @@ export interface GraphRepository {
 
 	upsertEdge(edge: GraphEdge): Promise<void>;
 
+	/**
+	 * Remove one stable graph relationship within a tenant.
+	 *
+	 * Ingestion code uses this to reconcile relationships whose source data has
+	 * changed (for example, files or Jira keys removed from a pull request).
+	 */
+	deleteEdge(tenantId: string, edgeId: string): Promise<boolean>;
+
 	getNode(tenantId: string, nodeId: string): Promise<GraphNode | null>;
 
 	getOutgoingEdges(

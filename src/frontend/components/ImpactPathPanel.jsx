@@ -1,5 +1,5 @@
 import React from "react";
-import { Heading, Inline, SectionMessage, Stack, Text } from "@forge/react";
+import { Button, Heading, Inline, SectionMessage, Stack, Text } from "@forge/react";
 import { formatNumber, formatPercent } from "../utils/formatters";
 
 function EvidencePath({ path, index }) {
@@ -43,6 +43,11 @@ function EvidencePath({ path, index }) {
 									</Text>
 								)}
 							</Inline>
+							{node.url && (
+								<Button appearance="link" onClick={() => window.open(node.url, "_blank", "noopener,noreferrer")}>
+									Open in source
+								</Button>
+							)}
 
 							<Text color="color.text.subtle" size="small">
 								{node.id}
@@ -51,7 +56,7 @@ function EvidencePath({ path, index }) {
 							{relationship && (
 								<Stack space="space.050">
 									<Text weight="semibold" size="small">
-										↓ {relationship.type ?? "RELATED_TO"}
+										↓ {relationship.propagatedToDependent ? "IMPACTS_DEPENDENT" : relationship.type ?? "RELATED_TO"}
 									</Text>
 
 									{relationship.evidenceText && (

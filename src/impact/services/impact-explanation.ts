@@ -52,6 +52,11 @@ function getRelationshipEvidence(
 		};
 	}
 
+	const propagatedToDependent =
+		edge.type === "DEPENDS_ON" &&
+		edge.sourceNodeId === targetNodeId &&
+		edge.targetNodeId === sourceNodeId;
+
 	return {
 		edgeId,
 		type: edge.type,
@@ -66,6 +71,7 @@ function getRelationshipEvidence(
 		...(edge.provenance.evidenceText
 			? { evidenceText: edge.provenance.evidenceText }
 			: {}),
+		...(propagatedToDependent ? { propagatedToDependent: true } : {}),
 	};
 }
 
@@ -106,9 +112,11 @@ function buildPathDescription(evidence: ImpactPathEvidence): string {
 	for (let index = 0; index < evidence.relationships.length; index++) {
 		const relationship = evidence.relationships[index];
 
-		description +=
-			` --${relationship.type ?? "UNKNOWN_RELATIONSHIP"}--> ` +
-			evidence.nodes[index + 1].name;
+		const label = relationship.propagatedToDependent
+			? "IMPACTS_DEPENDENT"
+			: (relationship.type ?? "UNKNOWN_RELATIONSHIP");
+
+		description += ` --${label}--> ${evidence.nodes[index + 1].name}`;
 	}
 
 	return description;

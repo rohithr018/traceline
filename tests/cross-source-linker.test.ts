@@ -21,6 +21,16 @@ class FakeRepository implements GraphRepository {
 		this.edges.set(edge.id, edge);
 	}
 
+	async deleteEdge(tenantId: string, edgeId: string): Promise<boolean> {
+		const edge = this.edges.get(edgeId);
+
+		if (!edge || edge.tenantId !== tenantId) {
+			return false;
+		}
+
+		return this.edges.delete(edgeId);
+	}
+
 	async getNode(id: string, tenantId: string): Promise<GraphNode | null> {
 		const node = this.nodes.get(id);
 

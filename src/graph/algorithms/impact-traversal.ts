@@ -13,6 +13,13 @@ export interface ImpactInput {
 
 	minConfidence?: number;
 	propagationTypes?: EdgeType[];
+	/**
+	 * A configured SERVICE -> SERVICE DEPENDS_ON edge means that the source
+	 * service consumes the target service. For a code change, impact therefore
+	 * propagates in the reverse direction—from the changed dependency to its
+	 * consumers—while the graph retains its conventional dependency direction.
+	 */
+	reverseDependencyEdges?: boolean;
 }
 
 export interface ImpactPath {
@@ -59,6 +66,7 @@ export class ImpactTraversal {
 			maxPathsPerNode = 3,
 			minConfidence = 0.5,
 			propagationTypes = DEFAULT_PROPAGATION_TYPES,
+			reverseDependencyEdges = false,
 		} = input;
 
 		if (!Number.isInteger(maxDepth) || maxDepth < 0) {
@@ -111,22 +119,44 @@ export class ImpactTraversal {
 				continue;
 			}
 
-			const edges = await this.repository.getOutgoingEdges(
+			const outgoingTypes = reverseDependencyEdges
+				? propagationTypes.filter((type) => type !== "DEPENDS_ON")
+				: propagationTypes;
+
+			const outgoingEdges = await this.repository.getOutgoingEdges(
 				tenantId,
 				current.nodeId,
-				propagationTypes,
+				outgoingTypes,
 			);
 
-			for (const edge of edges) {
+			const incomingDependencyEdges =
+				reverseDependencyEdges && propagationTypes.includes("DEPENDS_ON")
+					? await this.repository.getIncomingEdges(tenantId, current.nodeId, [
+							"DEPENDS_ON",
+						])
+					: [];
+
+			const edges = [
+				...outgoingEdges.map((edge) => ({
+					edge,
+					nextNodeId: edge.targetNodeId,
+				})),
+				...incomingDependencyEdges.map((edge) => ({
+					edge,
+					nextNodeId: edge.sourceNodeId,
+				})),
+			];
+
+			for (const { edge, nextNodeId } of edges) {
 				if (edge.confidence < minConfidence) {
 					continue;
 				}
 
-				if (current.nodePath.includes(edge.targetNodeId)) {
+				if (current.nodePath.includes(nextNodeId)) {
 					continue;
 				}
 
-				const existingPaths = paths[edge.targetNodeId] ?? [];
+				const existingPaths = paths[nextNodeId] ?? [];
 
 				if (existingPaths.length >= maxPathsPerNode) {
 					truncated = true;
@@ -134,16 +164,16 @@ export class ImpactTraversal {
 				}
 
 				if (
-					!visitedNodes.has(edge.targetNodeId) &&
+					!visitedNodes.has(nextNodeId) &&
 					visitedNodes.size >= maxVisitedNodes
 				) {
 					truncated = true;
 					break;
 				}
 
-				visitedNodes.add(edge.targetNodeId);
+				visitedNodes.add(nextNodeId);
 
-				const nodePath = [...current.nodePath, edge.targetNodeId];
+				const nodePath = [...current.nodePath, nextNodeId];
 
 				const edgePath = [...current.edgePath, edge.id];
 
@@ -156,14 +186,14 @@ export class ImpactTraversal {
 					confidence,
 				};
 
-				if (!paths[edge.targetNodeId]) {
-					paths[edge.targetNodeId] = [];
+				if (!paths[nextNodeId]) {
+					paths[nextNodeId] = [];
 				}
 
-				paths[edge.targetNodeId].push(resultPath);
+				paths[nextNodeId].push(resultPath);
 
 				queue.push({
-					nodeId: edge.targetNodeId,
+					nodeId: nextNodeId,
 					nodePath,
 					edgePath,
 					confidence,

@@ -1,5 +1,5 @@
 import Resolver from "@forge/resolver";
-import api, { route } from "@forge/api";
+import api, { route, webTrigger } from "@forge/api";
 import { Queue } from "@forge/events";
 
 import { SqlGraphRepository } from "../../graph/repository/sql-graph-repository";
@@ -25,6 +25,17 @@ import {
 	validateCriticalityUpdateRequest,
 	validateCriticalityTarget,
 } from "../../risk/validation/criticality-validator";
+import { createBridgeSecret } from "../../integrations/bitbucket/bitbucket-bridge-crypto";
+import { BitbucketChangeImpactService } from "../../integrations/bitbucket/bitbucket-change-impact-service";
+import { ServiceConfigurationService } from "../../integrations/bitbucket/service-configuration-service";
+import { countIndexedJiraIssues } from "../../integrations/jira/jira-readiness";
+import type { ImpactAnalysisResult } from "../models/impact-analysis";
+import {
+	BitbucketBridgeStore,
+	BitbucketWorkspaceTenantMismatchError,
+	normalizeBitbucketWorkspaceUuid,
+} from "../../integrations/bitbucket/bitbucket-bridge-store";
+import { resolvePullRequestWorkspaceAssociation } from "../../integrations/bitbucket/bitbucket-workspace-association";
 
 const resolver = new Resolver();
 
@@ -33,6 +44,8 @@ const analysisService = new ImpactAnalysisService(repository);
 const checkpointStore = new SqlSyncCheckpointStore();
 const riskAnalysisService = new RiskAnalysisService();
 const criticalityService = new CriticalityService(repository);
+const bridgeStore = new BitbucketBridgeStore();
+const serviceConfigurationService = new ServiceConfigurationService(repository);
 
 interface ResolverContext {
 	cloudId?: string;
@@ -68,6 +81,253 @@ function failure(code: string, message: string): ApiError {
 			code,
 			message,
 		},
+	};
+}
+
+function extractWorkspaceUuid(payload: unknown): string | null {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+		return null;
+	}
+
+	const workspaceUuid = (payload as Record<string, unknown>).workspaceUuid;
+
+	if (typeof workspaceUuid !== "string") {
+		return null;
+	}
+
+	try {
+		return normalizeBitbucketWorkspaceUuid(workspaceUuid);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Pairing grants a workspace-level ingestion capability, so it is restricted
+ * to Jira site administrators rather than ordinary project collaborators.
+ */
+async function canAdministerJira(): Promise<boolean> {
+	try {
+		const response = await api
+			.asUser()
+			.requestJira(route`/rest/api/3/mypermissions?permissions=ADMINISTER`, {
+				headers: {
+					Accept: "application/json",
+				},
+			});
+
+		if (!response.ok) {
+			return false;
+		}
+
+		const result = (await response.json()) as {
+			permissions?: {
+				ADMINISTER?: {
+					havePermission?: boolean;
+				};
+			};
+		};
+
+		return result.permissions?.ADMINISTER?.havePermission === true;
+	} catch (error) {
+		console.error("Jira administration permission check failed:", error);
+		return false;
+	}
+}
+
+async function authorizeJiraSiteAdministrator(
+	context: ResolverContext,
+): Promise<ApiError | null> {
+	if (!context.cloudId) {
+		return failure(
+			"MISSING_INSTALLATION_CONTEXT",
+			"Unable to identify the current Jira installation.",
+		);
+	}
+
+	if (!context.accountId) {
+		return failure(
+			"AUTHENTICATION_REQUIRED",
+			"An authenticated Atlassian user is required.",
+		);
+	}
+
+	if (!(await canAdministerJira())) {
+		return failure(
+			"SITE_ADMIN_REQUIRED",
+			"Jira site administration permission is required for this TraceLine operation.",
+		);
+	}
+
+	return null;
+}
+
+async function getBridgeReceiverUrl(): Promise<string> {
+	return webTrigger.getUrl("traceline-bitbucket-bridge");
+}
+
+function asRecord(payload: unknown): Record<string, unknown> | null {
+	return payload !== null &&
+		typeof payload === "object" &&
+		!Array.isArray(payload)
+			? (payload as Record<string, unknown>)
+			: null;
+}
+
+function extractPullRequestNodeId(payload: unknown): string | null {
+	const value = asRecord(payload)?.pullRequestNodeId;
+
+	return typeof value === "string" && value.trim().length > 0 && value.length <= 255
+		? value.trim()
+		: null;
+}
+
+function parseTimestamp(value: unknown): number {
+	if (typeof value !== "string") {
+		return 0;
+	}
+
+	const timestamp = Date.parse(value);
+	return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function getChangedFiles(node: GraphNode): Array<Record<string, unknown>> {
+	const changedFiles = node.attributes.changedFiles;
+
+	if (!Array.isArray(changedFiles)) {
+		return [];
+	}
+
+	return changedFiles.filter(
+		(file): file is Record<string, unknown> =>
+			file !== null && typeof file === "object" && !Array.isArray(file),
+	);
+}
+
+/**
+ * Filter impact paths through user-readable Jira data before calculating or
+ * returning risk. Bitbucket nodes are included only for admin-gated PR routes.
+ */
+async function analyzeAuthorizedImpact(
+	tenantId: string,
+	analysis: ImpactAnalysisResult,
+	allowBitbucketNodes: boolean,
+) {
+	const [nodes, edges] = await Promise.all([
+		repository.listNodes(tenantId),
+		repository.listEdges(tenantId),
+	]);
+
+	const requiredNodeIds = new Set<string>();
+
+	for (const finding of analysis.findings) {
+		for (const path of finding.paths) {
+			for (const nodeId of path.nodeIds) {
+				requiredNodeIds.add(nodeId);
+			}
+		}
+	}
+
+	const potentialFindingIds = new Set(
+		analysis.findings.map((finding) => finding.nodeId),
+	);
+
+	for (const edge of edges) {
+		if (potentialFindingIds.has(edge.targetNodeId)) {
+			requiredNodeIds.add(edge.sourceNodeId);
+		}
+	}
+
+	const nodesById = new Map<string, GraphNode>(
+		nodes.map((node): [string, GraphNode] => [node.id, node]),
+	);
+
+	const nodesToAuthorize = [...requiredNodeIds]
+		.map((nodeId) => nodesById.get(nodeId))
+		.filter((node): node is GraphNode => node !== undefined);
+
+	const permissions = new Map<string, boolean>();
+	const batchSize = 10;
+
+	for (let index = 0; index < nodesToAuthorize.length; index += batchSize) {
+		const batch = nodesToAuthorize.slice(index, index + batchSize);
+		const results = await Promise.all(
+			batch.map(async (node) => ({
+				id: node.id,
+				allowed:
+					(allowBitbucketNodes && node.source === "BITBUCKET") ||
+					(await canReadNode(node)),
+			})),
+		);
+
+		for (const result of results) {
+			permissions.set(result.id, result.allowed);
+		}
+	}
+
+	const authorizedFindings = analysis.findings.flatMap((finding) => {
+		const authorizedPaths = finding.paths.filter((path) =>
+			path.nodeIds.every((nodeId) => permissions.get(nodeId) === true),
+		);
+
+		if (authorizedPaths.length === 0) {
+			return [];
+		}
+
+		return [
+			{
+				...finding,
+				paths: authorizedPaths,
+				minimumDepth: Math.min(...authorizedPaths.map((path) => path.depth)),
+				strongestPathConfidence: Math.max(
+					...authorizedPaths.map((path) => path.confidence),
+				),
+			},
+		];
+	});
+
+	const authorizedNodeIds = new Set(
+		[...permissions.entries()]
+			.filter(([, allowed]) => allowed)
+			.map(([nodeId]) => nodeId),
+	);
+	const authorizedNodes = nodes.filter((node) => authorizedNodeIds.has(node.id));
+	const authorizedFindingIds = new Set(
+		authorizedFindings.map((finding) => finding.nodeId),
+	);
+	const authorizedPathEdgeIds = new Set(
+		authorizedFindings.flatMap((finding) =>
+			finding.paths.flatMap((path) => path.edgeIds),
+		),
+	);
+	const authorizedEdges = edges.filter(
+		(edge) =>
+			authorizedNodeIds.has(edge.sourceNodeId) &&
+			authorizedNodeIds.has(edge.targetNodeId) &&
+			(authorizedPathEdgeIds.has(edge.id) ||
+				authorizedFindingIds.has(edge.targetNodeId)),
+	);
+
+	const scoredFindings = scoreImpactFindings(authorizedFindings, authorizedEdges);
+	const findings = explainImpactFindings(
+		scoredFindings,
+		authorizedNodes,
+		authorizedEdges,
+	);
+	const filteredAnalysis: ImpactAnalysisResult = {
+		...analysis,
+		findings,
+	};
+	const risk = await riskAnalysisService.analyze({
+		tenantId,
+		impactAnalysis: filteredAnalysis,
+		nodes: authorizedNodes,
+		edges: authorizedEdges,
+	});
+
+	return {
+		...filteredAnalysis,
+		risk,
 	};
 }
 
@@ -378,6 +638,654 @@ resolver.define(
 			return failure(
 				"SYNC_STATUS_FAILED",
 				"Unable to retrieve Jira synchronization status.",
+			);
+		}
+	},
+);
+
+/**
+ * Report only project access and aggregate ingestion readiness for setup.
+ * Project issue details stay behind the regular Jira permission check.
+ */
+resolver.define(
+	"setup.checkJiraProject",
+	async ({ payload, context }: ResolverRequest) => {
+		const tenantId = context.cloudId;
+
+		if (!tenantId) {
+			return failure(
+				"MISSING_INSTALLATION_CONTEXT",
+				"Unable to identify the current Jira installation.",
+			);
+		}
+
+		if (!context.accountId) {
+			return failure(
+				"AUTHENTICATION_REQUIRED",
+				"An authenticated Atlassian user is required.",
+			);
+		}
+
+		if (!(await canAdministerJira())) {
+			return failure(
+				"SITE_ADMIN_REQUIRED",
+				"Jira site administration permission is required to check TraceLine setup readiness.",
+			);
+		}
+
+		const projectKey = extractProjectKey(payload);
+
+		if (!projectKey) {
+			return failure(
+				"INVALID_PROJECT_KEY",
+				"A valid Jira project key is required.",
+			);
+		}
+
+		if (!(await canAccessProject(projectKey))) {
+			return failure(
+				"PROJECT_ACCESS_DENIED",
+				"You do not have permission to access this Jira project.",
+			);
+		}
+
+		try {
+			const [nodes, checkpoint] = await Promise.all([
+				repository.listNodes(tenantId),
+				checkpointStore.get(tenantId, "JIRA", projectKey),
+			]);
+			const indexedIssueCount = countIndexedJiraIssues(
+				nodes,
+				tenantId,
+				projectKey,
+			);
+
+			return {
+				ok: true,
+				data: {
+					projectKey,
+					accessible: true,
+					indexedIssueCount,
+					syncStatus: checkpoint?.status ?? "NOT_STARTED",
+					lastSuccessfulSyncAt: checkpoint?.lastSuccessfulSyncAt ?? null,
+					lastSyncError:
+						checkpoint?.status === "FAILED" ? checkpoint.lastError : null,
+				},
+			};
+		} catch (error) {
+			console.error("TraceLine Jira setup readiness lookup failed:", error);
+			return failure(
+				"JIRA_READINESS_FAILED",
+				"Unable to check Jira project ingestion readiness.",
+			);
+		}
+	},
+);
+
+/**
+ * Return pairing metadata without ever decrypting or exposing the shared
+ * secret. A pairing owned by another tenant is intentionally indistinguishable
+ * from an unpaired workspace.
+ */
+resolver.define(
+	"bridge.getPairingStatus",
+	async ({ payload, context }: ResolverRequest) => {
+		const authorizationFailure = await authorizeJiraSiteAdministrator(context);
+
+		if (authorizationFailure) {
+			return authorizationFailure;
+		}
+
+		const workspaceUuid = extractWorkspaceUuid(payload);
+
+		if (!workspaceUuid) {
+			return failure(
+				"INVALID_WORKSPACE_UUID",
+				"A valid Bitbucket workspace UUID is required.",
+			);
+		}
+
+		try {
+			const pairing = await bridgeStore.getWorkspacePairing(workspaceUuid);
+
+			if (!pairing || pairing.tenantId !== context.cloudId) {
+				return {
+					ok: true,
+					data: {
+						workspaceUuid,
+						paired: false,
+					},
+				};
+			}
+
+			return {
+				ok: true,
+				data: {
+					workspaceUuid: pairing.workspaceUuid,
+					paired: pairing.status === "ACTIVE",
+					status: pairing.status,
+					createdAt: pairing.createdAt,
+					updatedAt: pairing.updatedAt,
+				},
+			};
+		} catch (error) {
+			console.error("TraceLine bridge pairing status lookup failed:", error);
+
+			return failure(
+				"BRIDGE_PAIRING_STATUS_FAILED",
+				"Unable to retrieve Bitbucket workspace pairing status.",
+			);
+		}
+	},
+);
+
+resolver.define(
+	"bridge.pairWorkspace",
+	async ({ payload, context }: ResolverRequest) => {
+		const authorizationFailure = await authorizeJiraSiteAdministrator(context);
+
+		if (authorizationFailure) {
+			return authorizationFailure;
+		}
+
+		const workspaceUuid = extractWorkspaceUuid(payload);
+
+		if (!workspaceUuid) {
+			return failure(
+				"INVALID_WORKSPACE_UUID",
+				"A valid Bitbucket workspace UUID is required.",
+			);
+		}
+
+		const tenantId = context.cloudId!;
+
+		try {
+			const existing = await bridgeStore.getWorkspacePairing(workspaceUuid);
+
+			if (existing?.tenantId !== undefined && existing.tenantId !== tenantId) {
+				return failure(
+					"WORKSPACE_UNAVAILABLE",
+					"This Bitbucket workspace cannot be paired with this TraceLine site.",
+				);
+			}
+
+			if (existing?.status === "ACTIVE") {
+				return failure(
+					"WORKSPACE_ALREADY_PAIRED",
+					"This workspace is already paired. Use secret rotation to replace its companion configuration.",
+				);
+			}
+
+			const bridgeReceiverUrl = await getBridgeReceiverUrl();
+			const secret = createBridgeSecret();
+
+			await bridgeStore.registerWorkspace({
+				workspaceUuid,
+				tenantId,
+				secret,
+			});
+
+			// This is the only resolver response that contains the secret. It must
+			// be copied into the companion configuration immediately.
+			return {
+				ok: true,
+				data: {
+					workspaceUuid,
+					bridgeReceiverUrl,
+					secret,
+				},
+			};
+		} catch (error) {
+			if (error instanceof BitbucketWorkspaceTenantMismatchError) {
+				return failure(
+					"WORKSPACE_UNAVAILABLE",
+					"This Bitbucket workspace cannot be paired with this TraceLine site.",
+				);
+			}
+
+			console.error("TraceLine Bitbucket workspace pairing failed:", error);
+
+			return failure(
+				"BRIDGE_PAIRING_FAILED",
+				"Unable to pair the Bitbucket workspace. No secret was saved.",
+			);
+		}
+	},
+);
+
+resolver.define(
+	"bridge.rotateWorkspaceSecret",
+	async ({ payload, context }: ResolverRequest) => {
+		const authorizationFailure = await authorizeJiraSiteAdministrator(context);
+
+		if (authorizationFailure) {
+			return authorizationFailure;
+		}
+
+		const workspaceUuid = extractWorkspaceUuid(payload);
+
+		if (!workspaceUuid) {
+			return failure(
+				"INVALID_WORKSPACE_UUID",
+				"A valid Bitbucket workspace UUID is required.",
+			);
+		}
+
+		const tenantId = context.cloudId!;
+
+		try {
+			const existing = await bridgeStore.getWorkspacePairing(workspaceUuid);
+
+			if (!existing || existing.tenantId !== tenantId) {
+				return failure(
+					"WORKSPACE_NOT_PAIRED",
+					"This workspace is not paired with the current TraceLine site.",
+				);
+			}
+
+			const bridgeReceiverUrl = await getBridgeReceiverUrl();
+			const secret = createBridgeSecret();
+
+			await bridgeStore.registerWorkspace({
+				workspaceUuid,
+				tenantId,
+				secret,
+			});
+
+			return {
+				ok: true,
+				data: {
+					workspaceUuid,
+					bridgeReceiverUrl,
+					secret,
+				},
+			};
+		} catch (error) {
+			if (error instanceof BitbucketWorkspaceTenantMismatchError) {
+				return failure(
+					"WORKSPACE_NOT_PAIRED",
+					"This workspace is not paired with the current TraceLine site.",
+				);
+			}
+
+			console.error("TraceLine Bitbucket secret rotation failed:", error);
+
+			return failure(
+				"BRIDGE_SECRET_ROTATION_FAILED",
+				"Unable to rotate the Bitbucket workspace secret. The current secret remains active.",
+			);
+		}
+	},
+);
+
+resolver.define(
+	"service.listConfiguration",
+	async ({ context }: ResolverRequest) => {
+		const authorizationFailure = await authorizeJiraSiteAdministrator(context);
+
+		if (authorizationFailure) {
+			return authorizationFailure;
+		}
+
+		const tenantId = context.cloudId!;
+
+		try {
+			const [nodes, edges] = await Promise.all([
+				repository.listNodes(tenantId),
+				repository.listEdges(tenantId),
+			]);
+			const repositories = nodes.filter(
+				(node) => node.type === "REPOSITORY" && node.source === "BITBUCKET",
+			);
+			const pairings = new Map<string, boolean>();
+
+			await Promise.all(
+				repositories.map(async (node) => {
+					const workspaceUuid = node.attributes.workspaceId;
+
+					if (typeof workspaceUuid !== "string" || !workspaceUuid.trim()) {
+						return;
+					}
+
+					try {
+						const pairing = await bridgeStore.getWorkspacePairing(workspaceUuid);
+						pairings.set(
+							workspaceUuid,
+							pairing?.tenantId === tenantId && pairing.status === "ACTIVE",
+						);
+					} catch {
+						pairings.set(workspaceUuid, false);
+					}
+				}),
+			);
+
+			return {
+				ok: true,
+				data: {
+					repositories: repositories.map((node) => {
+						const workspaceUuid = node.attributes.workspaceId;
+
+						return {
+							id: node.id,
+						repositoryUuid:
+								typeof node.attributes.repositoryUuid === "string"
+									? node.attributes.repositoryUuid
+									: node.externalId,
+							name: node.name,
+							fullName: node.attributes.fullName ?? null,
+							url: node.url ?? null,
+							isPrivate: node.attributes.isPrivate === true,
+							workspaceUuid:
+								typeof workspaceUuid === "string" ? workspaceUuid : null,
+							paired:
+								typeof workspaceUuid === "string"
+									? pairings.get(workspaceUuid) === true
+									: false,
+						};
+					}),
+					services: nodes
+						.filter((node) => node.type === "SERVICE" && node.source === "USER")
+						.map((node) => ({
+							id: node.id,
+							name: node.name,
+							criticality: node.attributes.criticality ?? "UNKNOWN",
+							mappings: Array.isArray(node.attributes.bitbucketSourceMappings)
+								? node.attributes.bitbucketSourceMappings
+								: [],
+							dependsOnServiceIds: edges
+								.filter(
+									(edge) =>
+										edge.sourceNodeId === node.id &&
+										edge.type === "DEPENDS_ON",
+								)
+								.map((edge) => edge.targetNodeId)
+								.sort(),
+						})),
+				},
+			};
+		} catch (error) {
+			console.error("TraceLine service configuration lookup failed:", error);
+			return failure(
+				"SERVICE_CONFIGURATION_FAILED",
+				"Unable to retrieve connected repositories and service configuration.",
+			);
+		}
+	},
+);
+
+resolver.define(
+	"service.saveConfiguration",
+	async ({ payload, context }: ResolverRequest) => {
+		const authorizationFailure = await authorizeJiraSiteAdministrator(context);
+
+		if (authorizationFailure) {
+			return authorizationFailure;
+		}
+
+		const tenantId = context.cloudId!;
+		const accountId = context.accountId!;
+		const input = asRecord(payload);
+
+		if (
+			!input ||
+			typeof input.serviceId !== "string" ||
+			typeof input.name !== "string" ||
+			!Array.isArray(input.mappings)
+		) {
+			return failure(
+				"INVALID_SERVICE_CONFIGURATION",
+				"A service ID, name, source mappings, and criticality are required.",
+			);
+		}
+
+		try {
+			const result = await serviceConfigurationService.save({
+				tenantId,
+				updatedBy: accountId,
+				serviceId: input.serviceId,
+				name: input.name,
+				mappings: input.mappings,
+				dependsOnServiceIds: input.dependsOnServiceIds,
+				criticality: input.criticality,
+			});
+
+			return {
+				ok: true,
+				data: {
+					service: {
+						id: result.service.id,
+						name: result.service.name,
+						criticality: result.service.attributes.criticality,
+						mappings: result.mappings,
+						dependsOnServiceIds: result.dependsOnServiceIds,
+					},
+					staleDependenciesRemoved: result.staleDependenciesRemoved,
+				},
+			};
+		} catch (error) {
+			const message =
+				error instanceof Error
+					? error.message
+					: "Invalid service configuration.";
+
+			if (
+				message.includes("required") ||
+				message.includes("invalid") ||
+				message.includes("must ") ||
+				message.includes("cannot ") ||
+				message.includes("no more than") ||
+				message.includes("duplicates") ||
+				message.includes("does not exist") ||
+				message.includes("has not been received") ||
+				message.includes("format") ||
+				message.includes("characters")
+			) {
+				return failure("INVALID_SERVICE_CONFIGURATION", message);
+			}
+
+			console.error("TraceLine service configuration save failed:", error);
+			return failure(
+				"SERVICE_CONFIGURATION_SAVE_FAILED",
+				"Unable to save the service configuration.",
+			);
+		}
+	},
+);
+
+resolver.define(
+	"bitbucket.listPullRequests",
+	async ({ context }: ResolverRequest) => {
+		const authorizationFailure = await authorizeJiraSiteAdministrator(context);
+
+		if (authorizationFailure) {
+			return authorizationFailure;
+		}
+
+		try {
+			const tenantId = context.cloudId!;
+			const nodes = await repository.listNodes(tenantId);
+			const pullRequests = nodes
+				.filter(
+					(node) =>
+						node.type === "PULL_REQUEST" && node.source === "BITBUCKET",
+				)
+				.sort(
+					(a, b) =>
+						parseTimestamp(b.attributes.updatedOn) -
+						parseTimestamp(a.attributes.updatedOn),
+				)
+				.slice(0, 100);
+
+			return {
+				ok: true,
+				data: {
+					pullRequests: pullRequests.map((node) => ({
+						id: node.id,
+						name: node.name,
+						url: node.url ?? null,
+						state: node.attributes.state ?? "UNKNOWN",
+						author:
+							typeof asRecord(node.attributes.author)?.displayName === "string"
+								? asRecord(node.attributes.author)?.displayName
+								: null,
+						repository:
+							node.attributes.repositoryFullName ??
+							node.attributes.repositorySlug ??
+							"Unknown repository",
+						repositoryUuid: node.attributes.repositoryUuid ?? null,
+						changedFileCount: getChangedFiles(node).length,
+						updatedOn: node.attributes.updatedOn ?? null,
+						risk: null,
+					})),
+				},
+			};
+		} catch (error) {
+			console.error("TraceLine pull request list failed:", error);
+			return failure(
+				"PULL_REQUEST_LIST_FAILED",
+				"Unable to retrieve Bitbucket pull requests.",
+			);
+		}
+	},
+);
+
+resolver.define(
+	"bitbucket.analyzePullRequest",
+	async ({ payload, context }: ResolverRequest) => {
+		const authorizationFailure = await authorizeJiraSiteAdministrator(context);
+
+		if (authorizationFailure) {
+			return authorizationFailure;
+		}
+
+		const tenantId = context.cloudId!;
+		const pullRequestNodeId = extractPullRequestNodeId(payload);
+
+		if (!pullRequestNodeId) {
+			return failure(
+				"INVALID_PULL_REQUEST",
+				"A valid Bitbucket pull request is required.",
+			);
+		}
+
+		try {
+			const pullRequest = await repository.getNode(tenantId, pullRequestNodeId);
+
+			if (
+				!pullRequest ||
+				pullRequest.type !== "PULL_REQUEST" ||
+				pullRequest.source !== "BITBUCKET"
+			) {
+				return failure(
+					"PULL_REQUEST_NOT_FOUND",
+					"The pull request is not available in this TraceLine site.",
+				);
+			}
+
+			const workspaceAssociation = await resolvePullRequestWorkspaceAssociation(
+				repository,
+				tenantId,
+				pullRequest,
+			);
+
+			if (!workspaceAssociation) {
+				return failure(
+					"WORKSPACE_NOT_PAIRED",
+					"The pull request is missing its paired Bitbucket workspace.",
+				);
+			}
+
+			const workspaceUuid = workspaceAssociation.workspaceUuid;
+
+			// Older bridge events could create a PR before its workspace attribute
+			// was persisted. Repair that record only from the matching, same-tenant
+			// repository node, never from the frontend request.
+			if (workspaceAssociation.source === "REPOSITORY") {
+				await repository.upsertNode({
+					...pullRequest,
+					attributes: {
+						...pullRequest.attributes,
+						workspaceId: workspaceUuid,
+					},
+				});
+			}
+
+			const pairing = await bridgeStore.getWorkspacePairing(workspaceUuid);
+
+			if (
+				!pairing ||
+				pairing.tenantId !== tenantId ||
+				pairing.status !== "ACTIVE"
+			) {
+				return failure(
+					"WORKSPACE_NOT_PAIRED",
+					"The pull request's Bitbucket workspace is not actively paired with this TraceLine site.",
+				);
+			}
+
+			const changeImpactService = new BitbucketChangeImpactService<ImpactAnalysisResult>(
+				repository,
+				{ analyze: (request) => analysisService.analyze(request) },
+			);
+			const result = await changeImpactService.analyzePullRequest({
+				tenantId,
+				pullRequestNodeId,
+				propagationTypes: ["MODIFIES", "DEPENDS_ON", "BLOCKS", "IMPLEMENTS"],
+				reverseDependencyEdges: true,
+			});
+			const authorizedAnalysis = await analyzeAuthorizedImpact(
+				tenantId,
+				result.analysis,
+				true,
+			);
+			const changedFiles = getChangedFiles(pullRequest);
+			const [edges, nodes] = await Promise.all([
+				repository.getOutgoingEdges(tenantId, pullRequest.id, ["MODIFIES"]),
+				repository.listNodes(tenantId),
+			]);
+			const nodesById = new Map(nodes.map((node) => [node.id, node]));
+
+			return {
+				ok: true,
+				data: {
+					pullRequest: {
+						id: pullRequest.id,
+						name: pullRequest.name,
+						url: pullRequest.url ?? null,
+						state: pullRequest.attributes.state ?? "UNKNOWN",
+						author:
+							asRecord(pullRequest.attributes.author)?.displayName ?? null,
+						repository:
+							pullRequest.attributes.repositoryFullName ??
+							pullRequest.attributes.repositorySlug ??
+							"Unknown repository",
+						updatedOn: pullRequest.attributes.updatedOn ?? null,
+					},
+					changedFiles,
+					mapping: {
+						...result.mapping,
+						matchedServiceCount: result.mapping.matchedServices,
+						matchedServices: edges.map((edge) => ({
+							id: edge.targetNodeId,
+							name: nodesById.get(edge.targetNodeId)?.name ?? edge.targetNodeId,
+							evidenceText: edge.provenance.evidenceText ?? null,
+						})),
+					},
+					analysis: authorizedAnalysis,
+				},
+			};
+		} catch (error) {
+			if (error instanceof GraphNodeNotFoundError) {
+				return failure(
+					"PULL_REQUEST_NOT_FOUND",
+					"The pull request is not available in this TraceLine site.",
+				);
+			}
+
+			console.error("TraceLine pull request analysis failed:", error);
+			return failure(
+				"PULL_REQUEST_ANALYSIS_FAILED",
+				"The pull request impact analysis could not be completed.",
 			);
 		}
 	},

@@ -2,7 +2,7 @@ import type { GraphNode } from "../../graph/models/graph-node";
 import type { GraphEdge } from "../../graph/models/graph-edge";
 import type { ImpactAnalysisResult } from "../../impact/models/impact-analysis";
 
-export type RiskLevel = "MINIMAL" | "LOW" | "MODERATE" | "HIGH" | "CRITICAL";
+export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 
 export type ComponentCriticality =
 	| "UNKNOWN"

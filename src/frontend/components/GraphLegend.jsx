@@ -1,7 +1,7 @@
 import React from "react";
 import { Inline, Text } from "@forge/react";
 
-export default function GraphLegend() {
+export default function GraphLegend({ sourceLabel = "Source is the current Jira issue." }) {
 	return (
 		<Inline
 			alignBlock="center"
@@ -12,7 +12,7 @@ export default function GraphLegend() {
 			<Text size="small" weight="semibold">
 				Graph guide:
 			</Text>
-			<Text size="small">Source is the current Jira issue.</Text>
+			<Text size="small">{sourceLabel}</Text>
 			<Text size="small">Select a node to inspect its relationships.</Text>
 		</Inline>
 	);

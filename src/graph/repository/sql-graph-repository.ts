@@ -1,4 +1,4 @@
-import { sql } from "@forge/sql";
+import { sql, type UpdateQueryResponse } from "@forge/sql";
 
 import type { GraphNode } from "../models/graph-node";
 import type { GraphEdge, EdgeType } from "../models/graph-edge";
@@ -174,6 +174,19 @@ export class SqlGraphRepository implements GraphRepository {
 				edge.updatedAt,
 			)
 			.execute();
+	}
+
+	async deleteEdge(tenantId: string, edgeId: string): Promise<boolean> {
+		const result = await sql
+			.prepare<UpdateQueryResponse>(
+				`DELETE FROM graph_edges
+         WHERE tenant_id = ?
+           AND id = ?`,
+			)
+			.bindParams(tenantId, edgeId)
+			.execute();
+
+		return result.rows.affectedRows === 1;
 	}
 
 	async getNode(tenantId: string, nodeId: string): Promise<GraphNode | null> {

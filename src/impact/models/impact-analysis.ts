@@ -30,6 +30,8 @@ export interface ImpactRelationshipEvidence {
 	sourceSystem?: string;
 	externalReference?: string;
 	evidenceText?: string;
+	/** The path traversed a conventional DEPENDS_ON edge in reverse. */
+	propagatedToDependent?: boolean;
 }
 
 export interface ImpactPathEvidence {

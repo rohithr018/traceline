@@ -29,7 +29,7 @@ export class RiskAnalysisService {
 			return {
 				sourceNodeId: input.impactAnalysis.sourceNodeId,
 				overallScore: 0,
-				overallLevel: "MINIMAL",
+				overallLevel: "LOW",
 				averageRisk: 0,
 				maximumRisk: 0,
 				affectedNodeCount: 0,

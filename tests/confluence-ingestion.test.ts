@@ -20,6 +20,10 @@ class FakeRepository implements GraphRepository {
 
 	async upsertEdge(_edge: GraphEdge): Promise<void> {}
 
+	async deleteEdge(): Promise<boolean> {
+		return false;
+	}
+
 	async getNode(id: string, tenantId: string): Promise<GraphNode | null> {
 		const node = this.nodes.get(id);
 

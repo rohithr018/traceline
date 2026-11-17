@@ -140,4 +140,6 @@ export * from "./risk/validation/risk-request-validator";
 export * from "./risk/services/risk-scoring";
 export * from "./risk/services/risk-analysis-service";
 
+export { receiveBitbucketBridgeEvent } from "./integrations/bitbucket/bitbucket-bridge-receiver";
+
 export { impactAnalysisHandler };

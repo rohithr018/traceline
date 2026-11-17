@@ -1,5 +1,6 @@
 .traceline-verify-token
 token.env
+/.txt
 node_modules/
 .forge
 dist/

@@ -89,7 +89,7 @@ export class JiraIngestionService {
 
 				const linkedNodeId = `jira:issue:${linkedIssue.id}`;
 
-				const existing = await this.repository.getNode(linkedNodeId, tenantId);
+				const existing = await this.repository.getNode(tenantId, linkedNodeId);
 
 				if (existing) {
 					continue;

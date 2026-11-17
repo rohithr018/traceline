@@ -61,6 +61,10 @@ export class InMemoryGraphRepository implements GraphRepository {
 		});
 	}
 
+	async deleteEdge(tenantId: string, edgeId: string): Promise<boolean> {
+		return this.edges.delete(this.key(tenantId, edgeId));
+	}
+
 	async getNode(tenantId: string, nodeId: string): Promise<GraphNode | null> {
 		const node = this.nodes.get(this.key(tenantId, nodeId));
 

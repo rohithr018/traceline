@@ -186,3 +186,37 @@ test("preserves existing score and severity", () => {
 	assert.equal(result[0].score, 90);
 	assert.equal(result[0].severity, "CRITICAL");
 });
+
+test("explains reverse dependency propagation as impact on a consumer", () => {
+	const finding: ImpactFinding = {
+		...makeFinding(),
+		paths: [
+			{
+				nodeIds: ["PROJ-1", "PROJ-2"],
+				edgeIds: ["dependency-edge"],
+				depth: 1,
+				confidence: 1,
+			},
+		],
+	};
+
+	const dependencyEdge = {
+		...makeEdge("dependency-edge", "PROJ-2", "PROJ-1"),
+		type: "DEPENDS_ON" as const,
+	};
+
+	const result = explainImpactFindings(
+		[finding],
+		[
+			makeNode("PROJ-1", "Payment Service"),
+			makeNode("PROJ-2", "Checkout Service"),
+		],
+		[dependencyEdge],
+	);
+
+	assert.equal(result[0].evidence![0].relationships[0].propagatedToDependent, true);
+	assert.match(
+		result[0].explanation!,
+		/Payment Service --IMPACTS_DEPENDENT--> Checkout Service/,
+	);
+});

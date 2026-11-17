@@ -51,7 +51,6 @@ export function getRiskAppearance(level) {
 		case "HIGH":
 			return "warning";
 		case "LOW":
-		case "MINIMAL":
 			return "confirmation";
 		default:
 			return "information";
@@ -64,12 +63,10 @@ export function getRiskLevelLabel(level) {
 			return "Critical risk";
 		case "HIGH":
 			return "High risk";
-		case "MODERATE":
-			return "Moderate risk";
+		case "MEDIUM":
+			return "Medium risk";
 		case "LOW":
 			return "Low risk";
-		case "MINIMAL":
-			return "Minimal risk";
 		default:
 			return "Unclassified risk";
 	}

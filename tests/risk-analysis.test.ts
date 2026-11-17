@@ -59,10 +59,10 @@ function makeAnalysis(
 }
 
 test("risk levels use the configured thresholds", () => {
-	assert.equal(getRiskLevel(0), "MINIMAL");
-	assert.equal(getRiskLevel(19.99), "MINIMAL");
-	assert.equal(getRiskLevel(20), "LOW");
-	assert.equal(getRiskLevel(40), "MODERATE");
+	assert.equal(getRiskLevel(0), "LOW");
+	assert.equal(getRiskLevel(34.99), "LOW");
+	assert.equal(getRiskLevel(35), "MEDIUM");
+	assert.equal(getRiskLevel(59.99), "MEDIUM");
 	assert.equal(getRiskLevel(60), "HIGH");
 	assert.equal(getRiskLevel(80), "CRITICAL");
 	assert.equal(getRiskLevel(100), "CRITICAL");

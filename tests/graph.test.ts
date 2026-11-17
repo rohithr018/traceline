@@ -106,6 +106,41 @@ test("traversal respects maximum depth", async () => {
 	]);
 });
 
+test("PR impact traversal reaches consumers through reverse dependency edges", async () => {
+	const { repository, tenantId } = await buildSampleGraph();
+
+	// The configuration convention is consumer -> dependency. A change to the
+	// dependency must therefore propagate to its consumer in reverse.
+	await repository.upsertEdge(
+		createGraphEdge({
+			id: "configured-checkout-depends-on-payment",
+			tenantId,
+			sourceNodeId: "checkout-service",
+			targetNodeId: "payment-service",
+			type: "DEPENDS_ON",
+			weight: 1,
+			confidence: 1,
+			provenance: { sourceSystem: "USER" },
+		}),
+	);
+
+	const traversal = new ImpactTraversal(repository);
+	const result = await traversal.analyze({
+		tenantId,
+		sourceNodeId: "payment-service",
+		propagationTypes: ["DEPENDS_ON"],
+		reverseDependencyEdges: true,
+	});
+
+	assert.ok(result.affectedNodeIds.includes("checkout-service"));
+	assert.equal(
+		result.paths["checkout-service"].some((path) =>
+			path.edgeIds.includes("configured-checkout-depends-on-payment"),
+		),
+		true,
+	);
+});
+
 test("missing source node throws an error", async () => {
 	const { repository, tenantId } = await buildSampleGraph();
 
